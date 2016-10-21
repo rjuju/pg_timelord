@@ -1,0 +1,186 @@
+/*
+ * pg_timelord
+ *
+ * Enable time traveling.
+ *
+ * TODO:
+ *   * add a GUC to prevent VACUUM from removing recent enough data
+ *   * work harder on the satisfies function
+ *   * verify it works
+ *
+ * This program is open source, licensed under the PostgreSQL license.
+ * For license terms, see the LICENSE file.
+ *
+ */
+#include "postgres.h"
+
+#include "access/commit_ts.h"
+#include "access/htup_details.h"
+#include "access/xact.h"
+#include "datatype/timestamp.h"
+#include "executor/executor.h"
+#include "funcapi.h"
+#include "miscadmin.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/snapshot.h"
+#include "utils/timestamp.h"
+#include "utils/tqual.h"
+
+
+PG_MODULE_MAGIC;
+
+
+/* saved hook address in case of unload */
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+
+/*--- Functions --- */
+
+void	_PG_init(void);
+void	_PG_fini(void);
+bool	check_pgtl_ts(char **newval, void **extra, GucSource source);
+void	assign_pgtl_ts(const char *newval, void *extra);
+
+static void pgtl_ExecutorStart(QueryDesc *queryDesc, int eflags);
+bool HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
+								Buffer buffer);
+
+static char *pgtl_ts_char;
+static TimestampTz pgtl_ts = 0;
+
+void
+_PG_init(void)
+{
+	if (!process_shared_preload_libraries_in_progress)
+	{
+		elog(ERROR, "This module can only be loaded via shared_preload_libraries");
+		return;
+	}
+
+	if (!track_commit_timestamp)
+	{
+		elog(ERROR, "I need track_commit_timestamp enabled as a timelord need his tardis!");
+	}
+
+	/* Install hook */
+	prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = pgtl_ExecutorStart;
+
+	DefineCustomStringVariable("pg_timelord.ts",
+							 "Timestamp with time zone destination",
+							 NULL,
+							 &pgtl_ts_char,
+							 "",
+							 PGC_USERSET,
+							 0,
+							 check_pgtl_ts,
+							 assign_pgtl_ts,
+							 NULL);
+}
+
+void
+_PG_fini(void)
+{
+	/* uninstall hook */
+	ExecutorStart_hook = prev_ExecutorStart;
+}
+
+bool
+check_pgtl_ts(char **newval, void **extra, GucSource source)
+{
+	TimestampTz newTs = 0;
+
+	if (!track_commit_timestamp)
+	{
+		elog(ERROR, "I need track_commit_timestamp enabled as a timelord need his tardis!");
+		return false;
+	}
+
+	if (strcmp(*newval, "") != 0)
+	{
+		/* new char is needed, don't know why *newval doesn't work */
+		char *str = pstrdup(*newval);
+
+		newTs = DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
+					CStringGetDatum(str),
+					ObjectIdGetDatum(InvalidOid),
+					Int32GetDatum(-1)));
+		pfree(str);
+	}
+
+	*extra = malloc(sizeof(TimestampTz));
+	if (!*extra)
+		return false;
+	*((TimestampTz *) *extra) = newTs;
+
+	return true;
+}
+
+void
+assign_pgtl_ts(const char *newval, void *extra)
+{
+	pgtl_ts = *((TimestampTz *) extra);
+}
+
+static void
+pgtl_ExecutorStart (QueryDesc *queryDesc, int eflags)
+{
+	/* do not mess with non MVCC snapshots, like index build :) */
+	if (pgtl_ts != 0 && IsMVCCSnapshot(queryDesc->snapshot))
+		queryDesc->snapshot->satisfies = HeapTupleSatisfiesTimeLord;
+
+	if (prev_ExecutorStart)
+		prev_ExecutorStart(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
+}
+
+bool
+HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
+					   Buffer buffer)
+{
+	/* naive way FTW */
+	HeapTupleHeader tuple = htup->t_data;
+	TransactionId xmin = HeapTupleHeaderGetXmin(tuple);
+	TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple);
+
+	/* really inserted ? */
+	if (HeapTupleHeaderXminCommitted(tuple) && TransactionIdDidCommit(xmin))
+	{
+		TimestampTz insert_ts;
+		RepOriginId nodeid;
+
+		if (xmin != FrozenTransactionId)
+		{
+			if (!TransactionIdGetCommitTsData(xmin, &insert_ts, &nodeid))
+				/* too old, too bad */
+				elog(ERROR, "You requested too old snapshot");
+
+			if (timestamp_cmp_internal(pgtl_ts, insert_ts) <= 0)
+				/* not visible yet */
+				return false;
+		}
+	}
+
+	/* at this point, xmin has committed, what about xmax ? */
+	/* check hint bit first */
+	if ((tuple->t_infomask & HEAP_XMAX_COMMITTED) ||
+		/* check clog */
+		TransactionIdDidCommit(xmax))
+	{
+		TimestampTz delete_ts;
+		RepOriginId nodeid;
+
+		if (xmax != FrozenTransactionId)
+		{
+			if (!TransactionIdGetCommitTsData(xmax, &delete_ts, &nodeid))
+				/* too old, too bad */
+				elog(ERROR, "You requested too old snapshot");
+
+			if (timestamp_cmp_internal(pgtl_ts, delete_ts) <= 0)
+				/* not visible yet */
+				return true;
+		}
+	}
+	return true;
+}
