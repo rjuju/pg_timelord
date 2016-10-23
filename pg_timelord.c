@@ -21,12 +21,13 @@
 #include "executor/executor.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/lwlock.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/snapshot.h"
 #include "utils/timestamp.h"
 #include "utils/tqual.h"
-#include "tcop/utility.h"
 
 
 PG_MODULE_MAGIC;
@@ -232,6 +233,17 @@ pgtl_ProcessUtility(Node *parsetree,
 			default:
 				elog(ERROR, "You cannot run utility statement in the past!");
 		}
+	}
+
+	/* forbid explicit VACUUM FREEZE, there's no way to modify oldest xact */
+	if (IsA(parsetree, VacuumStmt))
+	{
+		VacuumStmt *vacstmt = (VacuumStmt *) parsetree;
+
+		if (vacstmt->options & VACOPT_FREEZE)
+			elog(ERROR, "Explicit VACUUM FREEZE is disabled!");
+
+		/* XXX disble CLUSTER and VACUUM FULL too? */
 	}
 
 	if (prev_ProcessUtility)
