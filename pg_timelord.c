@@ -102,6 +102,8 @@ bool
 check_pgtl_ts(char **newval, void **extra, GucSource source)
 {
 	TimestampTz newTs = 0;
+	TransactionId oldest;
+	TimestampTz oldestTs = 0;
 
 	if (!track_commit_timestamp)
 	{
@@ -119,6 +121,26 @@ check_pgtl_ts(char **newval, void **extra, GucSource source)
 					ObjectIdGetDatum(InvalidOid),
 					Int32GetDatum(-1)));
 		pfree(str);
+
+		/* check if ts is recent enough */
+		LWLockAcquire(CommitTsLock, LW_SHARED);
+		oldest = ShmemVariableCache->oldestCommitTsXid;
+		LWLockRelease(CommitTsLock);
+
+		if (!TransactionIdGetCommitTsData(oldest, &oldestTs, NULL))
+		{
+			elog(ERROR, "Could not check data availability for ts %s", *newval);
+			return false;
+		}
+
+		if (timestamp_cmp_internal(newTs, oldestTs) < 0)
+		{
+			ereport(ERROR,
+					(errmsg("Requested ts %s is too old", *newval),
+					errdetail("Oldest ts available: %s",
+							  timestamptz_to_str(oldestTs))));
+			return false;
+		}
 	}
 
 	*extra = malloc(sizeof(TimestampTz));
@@ -256,11 +278,10 @@ HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 	if (HeapTupleHeaderXminCommitted(tuple) && TransactionIdDidCommit(xmin))
 	{
 		TimestampTz insert_ts;
-		RepOriginId nodeid;
 
 		if (xmin != FrozenTransactionId)
 		{
-			if (!TransactionIdGetCommitTsData(xmin, &insert_ts, &nodeid))
+			if (!TransactionIdGetCommitTsData(xmin, &insert_ts, NULL))
 				/* too old, too bad */
 				elog(ERROR, "You requested too old snapshot");
 
@@ -277,11 +298,10 @@ HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 		TransactionIdDidCommit(xmax))
 	{
 		TimestampTz delete_ts;
-		RepOriginId nodeid;
 
 		if (xmax != FrozenTransactionId)
 		{
-			if (!TransactionIdGetCommitTsData(xmax, &delete_ts, &nodeid))
+			if (!TransactionIdGetCommitTsData(xmax, &delete_ts, NULL))
 				/* too old, too bad */
 				elog(ERROR, "You requested too old snapshot");
 
