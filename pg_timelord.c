@@ -130,7 +130,10 @@ check_pgtl_ts(char **newval, void **extra, GucSource source)
 
 		if (!TransactionIdGetCommitTsData(oldest, &oldestTs, NULL))
 		{
-			elog(ERROR, "Could not check data availability for ts %s", *newval);
+			if (TransactionIdEquals(oldest, ReadNewTransactionId()))
+				elog(ERROR, "There is no previous commit stored");
+			else
+				elog(ERROR, "Could not check data availability for ts %s", *newval);
 			return false;
 		}
 
