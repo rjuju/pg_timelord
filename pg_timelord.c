@@ -307,6 +307,11 @@ HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 	TransactionId xmin = HeapTupleHeaderGetXmin(tuple);
 	TransactionId xmax = HeapTupleHeaderGetRawXmax(tuple);
 
+	Assert(TransactionIdIsValid(xmin));
+
+	if (!TransactionIdIsNormal(xmin)) /* frozen or bootstrap */
+		return true;
+
 	/* really inserted ? */
 	if (HeapTupleHeaderXminCommitted(tuple) && TransactionIdDidCommit(xmin))
 	{
