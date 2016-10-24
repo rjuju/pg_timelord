@@ -112,6 +112,17 @@ check_pgtl_ts(char **newval, void **extra, GucSource source)
 		return false;
 	}
 
+	if (IsTransactionBlock())
+	{
+		/*
+		 * no time travel if in a transaction
+		 * XXX allow if transaction began while time traveling and changing
+		 * date?
+		 */
+		elog(ERROR, "No time travel inside a transaction");
+		return false;
+	}
+
 	if (strcmp(*newval, "") != 0)
 	{
 		/* new char is needed, don't know why *newval doesn't work */
@@ -217,6 +228,12 @@ pgtl_ProcessUtility(Node *parsetree,
 							}
 						}
 					}
+					/*
+					 * I keep the code above just in case I want to allow it
+					 * again sometime in the future, but for now just forbid
+					 * any transaction in the past
+					 */
+					elog(ERROR, "You cannot use TCL in the past!");
 				}
 			case T_VariableSetStmt:
 			case T_VariableShowStmt:
@@ -234,7 +251,8 @@ pgtl_ProcessUtility(Node *parsetree,
 				/* whitelist of utility command */
 				break;
 			default:
-				elog(ERROR, "You cannot run utility statement in the past!");
+				elog(ERROR, "You cannot run utility command \"%s\" in the past!",
+						CreateCommandTag(parsetree));
 		}
 	}
 
