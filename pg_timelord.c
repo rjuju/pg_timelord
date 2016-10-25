@@ -283,7 +283,6 @@ check_pgtl_ts(char **newval, void **extra, GucSource source)
 	TimestampTz newTs = 0;
 	TransactionId oldest;
 	TimestampTz oldestTs = 0;
-	bool	ok = false;
 
 	if (!track_commit_timestamp)
 	{
@@ -302,10 +301,10 @@ check_pgtl_ts(char **newval, void **extra, GucSource source)
 		/* shmem avail and asked for ts, let's check a safe xid exists first */
 
 		LWLockAcquire(pgtl->lock, LW_SHARED);
-		ok = TransactionIdIsNormal(pgtl->oldestSafeTs);
+		oldest = pgtl->oldestSafeTs;
 		LWLockRelease(pgtl->lock);
 
-		if (!ok)
+		if (!TransactionIdIsNormal(oldest))
 		{
 			elog(ERROR, "No safe point is the past available yet");
 			return false;
@@ -335,10 +334,6 @@ check_pgtl_ts(char **newval, void **extra, GucSource source)
 		pfree(str);
 
 		/* check if ts is recent enough */
-		LWLockAcquire(CommitTsLock, LW_SHARED);
-		oldest = ShmemVariableCache->oldestCommitTsXid;
-		LWLockRelease(CommitTsLock);
-
 		if (!TransactionIdGetCommitTsData(oldest, &oldestTs, NULL))
 		{
 			if (TransactionIdEquals(oldest, ReadNewTransactionId()))
