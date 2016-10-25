@@ -54,7 +54,7 @@ static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 typedef struct pgtlSharedState
 {
 	LWLockId		lock;			/* protects counter modification */
-	TransactionId	oldestSafeTs;		/* oldest safe transactionid reachable */
+	TransactionId	oldestSafeXid;	/* oldest safe transactionid reachable */
 } pgtlSharedState;
 
 /* Links to shared memory state */
@@ -77,7 +77,7 @@ static void pgtl_ProcessUtility(Node *parsetree,
 
 void pgtl_preventWrite(void);
 void pgtl_restoreWrite(void);
-void pgtl_setOldestSafeTs(TransactionId newOldest);
+void pgtl_setoldestSafeXid(TransactionId newOldest);
 bool HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 								Buffer buffer);
 
@@ -189,7 +189,7 @@ pgtl_shmem_startup(void)
 			 * no stat file, probably initialization. A safe xid will be set
 			 * at first query execution
 			 */
-			pgtl_setOldestSafeTs(BootstrapTransactionId);
+			pgtl_setoldestSafeXid(BootstrapTransactionId);
 			return;			/* ignore not-found error */
 		}
 		goto error;
@@ -200,12 +200,12 @@ pgtl_shmem_startup(void)
 		header != PGTL_FILE_HEADER)
 		goto error;
 
-	/* read saved oldestSafeTs */
+	/* read saved oldestSafeXid */
 	if (fread(&temp_ts, sizeof(TransactionId), 1, file) != 1)
 		goto error;
 
 	/* restore the oldest safe transaction id */
-	pgtl_setOldestSafeTs(temp_ts);
+	pgtl_setoldestSafeXid(temp_ts);
 
 	FreeFile(file);
 	/*
@@ -246,7 +246,7 @@ pgtl_shmem_shutdown(int code, Datum arg)
 	if (fwrite(&PGTL_FILE_HEADER, sizeof(uint32), 1, file) != 1)
 		goto error;
 
-	if (fwrite(&pgtl->oldestSafeTs, sizeof(TransactionId), 1, file) != 1)
+	if (fwrite(&pgtl->oldestSafeXid, sizeof(TransactionId), 1, file) != 1)
 		goto error;
 
 	if (FreeFile(file))
@@ -301,7 +301,7 @@ check_pgtl_ts(char **newval, void **extra, GucSource source)
 		/* shmem avail and asked for ts, let's check a safe xid exists first */
 
 		LWLockAcquire(pgtl->lock, LW_SHARED);
-		oldest = pgtl->oldestSafeTs;
+		oldest = pgtl->oldestSafeXid;
 		LWLockRelease(pgtl->lock);
 
 		if (!TransactionIdIsNormal(oldest))
@@ -483,12 +483,12 @@ void pgtl_preventWrite(void)
 		old_XactReadOnly_changed = true;
 	}
 	/* test without lock first */
-	else if (TransactionIdEquals(pgtl->oldestSafeTs, BootstrapTransactionId))
+	else if (TransactionIdEquals(pgtl->oldestSafeXid, BootstrapTransactionId))
 	{
 		/* new test with the lock, and set value if needed */
 		LWLockAcquire(pgtl->lock, LW_EXCLUSIVE);
-		if (pgtl->oldestSafeTs == BootstrapTransactionId)
-			pgtl->oldestSafeTs = ReadNewTransactionId();
+		if (pgtl->oldestSafeXid == BootstrapTransactionId)
+			pgtl->oldestSafeXid = ReadNewTransactionId();
 		LWLockRelease(pgtl->lock);
 	}
 }
@@ -503,14 +503,13 @@ void pgtl_restoreWrite(void)
 }
 
 void
-pgtl_setOldestSafeTs(TransactionId newOldest)
+pgtl_setoldestSafeXid(TransactionId newOldest)
 {
-	elog(WARNING, "set %d", newOldest);
 	Assert(TransactionIdIsValid(newOldest));
-	Assert(TransactionIdPrecedesOrEquals(pgtl->oldestSafeTs, newOldest));
+	Assert(TransactionIdPrecedesOrEquals(pgtl->oldestSafeXid, newOldest));
 
 	LWLockAcquire(pgtl->lock, LW_EXCLUSIVE);
-	pgtl->oldestSafeTs = newOldest;
+	pgtl->oldestSafeXid = newOldest;
 	LWLockRelease(pgtl->lock);
 }
 
