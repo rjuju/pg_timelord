@@ -14,6 +14,8 @@
  */
 #include "postgres.h"
 
+#include <unistd.h>
+
 #include "access/commit_ts.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -21,7 +23,9 @@
 #include "executor/executor.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/shmem.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -32,9 +36,29 @@
 
 PG_MODULE_MAGIC;
 
+#if PG_VERSION_NUM >= 90300
+#define PGTL_DUMP_FILE		"pg_stat/pg_timelord.stat"
+#else
+#define PGTL_DUMP_FILE		"global/pg_timelord.stat"
+#endif
 
+static const uint32 PGTL_FILE_HEADER = 0x20161025;
+
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+
+/*
+ * Global shared state
+ */
+typedef struct pgtlSharedState
+{
+	LWLockId		lock;			/* protects counter modification */
+	TransactionId	oldestSafeTs;		/* oldest safe transactionid reachable */
+} pgtlSharedState;
+
+/* Links to shared memory state */
+static pgtlSharedState *pgtl = NULL;
 
 /*--- Functions --- */
 
@@ -43,6 +67,8 @@ void	_PG_fini(void);
 bool	check_pgtl_ts(char **newval, void **extra, GucSource source);
 void	assign_pgtl_ts(const char *newval, void *extra);
 
+static void pgtl_shmem_startup(void);
+static void pgtl_shmem_shutdown(int code, Datum arg);
 static void pgtl_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pgtl_ProcessUtility(Node *parsetree,
 		const char *queryString, ProcessUtilityContext context,
@@ -51,6 +77,7 @@ static void pgtl_ProcessUtility(Node *parsetree,
 
 void pgtl_preventWrite(void);
 void pgtl_restoreWrite(void);
+void pgtl_setOldestSafeTs(TransactionId newOldest);
 bool HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 								Buffer buffer);
 
@@ -73,7 +100,16 @@ _PG_init(void)
 		elog(ERROR, "I need track_commit_timestamp enabled as a timelord need his tardis!");
 	}
 
+	RequestAddinShmemSpace(MAXALIGN(sizeof(pgtlSharedState)));
+#if PG_VERSION_NUM >= 90600
+	RequestNamedLWLockTranche("pg_timelord", 1);
+#else
+	RequestAddinLWLocks(1);
+#endif
+
 	/* Install hook */
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = pgtl_shmem_startup;
 	prev_ExecutorStart = ExecutorStart_hook;
 	ExecutorStart_hook = pgtl_ExecutorStart;
 	prev_ProcessUtility = ProcessUtility_hook;
@@ -95,8 +131,150 @@ void
 _PG_fini(void)
 {
 	/* uninstall hook */
+	shmem_startup_hook = prev_shmem_startup_hook;
 	ExecutorStart_hook = prev_ExecutorStart;
 	ProcessUtility_hook = prev_ProcessUtility;
+}
+
+static void
+pgtl_shmem_startup(void)
+{
+	bool		found;
+	FILE		*file;
+	uint32		header;
+	TransactionId temp_ts;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	/* reset in case this is a restart within the postmaster */
+	pgtl = NULL;
+
+	/* Create or attach to the shared memory state */
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	/* global access lock */
+	pgtl = ShmemInitStruct("pg_timelord",
+					sizeof(pgtlSharedState),
+					&found);
+
+	if (!found)
+	{
+		/* First time through ... */
+#if PG_VERSION_NUM >= 90600
+		pgtl->lock = &(GetNamedLWLockTranche("pg_timelord"))->lock;
+#else
+		pgtl->lock = LWLockAssign();
+#endif
+	}
+
+	LWLockRelease(AddinShmemInitLock);
+
+	if (!IsUnderPostmaster)
+		on_shmem_exit(pgtl_shmem_shutdown, (Datum) 0);
+
+	/*
+	 * Done if some other process already completed our initialization.
+	 */
+	if (found)
+		return;
+
+	/* Load stat file, don't care about locking */
+	file = AllocateFile(PGTL_DUMP_FILE, PG_BINARY_R);
+	if (file == NULL)
+	{
+		if (errno == ENOENT)
+		{
+			/*
+			 * no stat file, probably initialization. A safe xid will be set
+			 * at first query execution
+			 */
+			pgtl_setOldestSafeTs(BootstrapTransactionId);
+			return;			/* ignore not-found error */
+		}
+		goto error;
+	}
+
+	/* check is header is valid */
+	if (fread(&header, sizeof(uint32), 1, file) != 1 ||
+		header != PGTL_FILE_HEADER)
+		goto error;
+
+	/* read saved oldestSafeTs */
+	if (fread(&temp_ts, sizeof(TransactionId), 1, file) != 1)
+		goto error;
+
+	/* restore the oldest safe transaction id */
+	pgtl_setOldestSafeTs(temp_ts);
+
+	FreeFile(file);
+	/*
+	 * Remove the file so it's not included in backups/replication slaves,
+	 * etc. A new file will be written on next shutdown.
+	 */
+	unlink(PGTL_DUMP_FILE);
+
+	return;
+
+error:
+	ereport(LOG,
+			(errcode_for_file_access(),
+			 errmsg("could not read pg_timelord file \"%s\": %m",
+					PGTL_DUMP_FILE)));
+	if (file)
+		FreeFile(file);
+	/* delete bogus file, don't care of errors in this case */
+	unlink(PGTL_DUMP_FILE);
+}
+
+static void
+pgtl_shmem_shutdown(int code, Datum arg)
+{
+	FILE	*file;
+
+	/* Don't try to dump during a crash. */
+	if (code)
+		return;
+
+	if (!pgtl)
+		return;
+
+	file = AllocateFile(PGTL_DUMP_FILE ".tmp", PG_BINARY_W);
+	if (file == NULL)
+		goto error;
+
+	if (fwrite(&PGTL_FILE_HEADER, sizeof(uint32), 1, file) != 1)
+		goto error;
+
+	if (fwrite(&pgtl->oldestSafeTs, sizeof(TransactionId), 1, file) != 1)
+		goto error;
+
+	if (FreeFile(file))
+	{
+		file = NULL;
+		goto error;
+	}
+
+	/*
+	 * Rename file inplace
+	 */
+	if (rename(PGTL_DUMP_FILE ".tmp", PGTL_DUMP_FILE) != 0)
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not rename pg_timelord file \"%s\": %m",
+						PGTL_DUMP_FILE ".tmp")));
+
+	return;
+
+error:
+	ereport(LOG,
+			(errcode_for_file_access(),
+			 errmsg("could not read pg_timelord file \"%s\": %m",
+					PGTL_DUMP_FILE)));
+
+	if (file)
+		FreeFile(file);
+	unlink(PGTL_DUMP_FILE);
 }
 
 bool
@@ -105,11 +283,33 @@ check_pgtl_ts(char **newval, void **extra, GucSource source)
 	TimestampTz newTs = 0;
 	TransactionId oldest;
 	TimestampTz oldestTs = 0;
+	bool	ok = false;
 
 	if (!track_commit_timestamp)
 	{
 		elog(ERROR, "I need track_commit_timestamp enabled as a timelord need his tardis!");
 		return false;
+	}
+
+	if (!pgtl)
+	{
+		/* don't allow non empty default */
+		if (strcmp(*newval, "") != 0)
+			return false;
+	}
+	else
+	{
+		/* shmem avail and asked for ts, let's check a safe xid exists first */
+
+		LWLockAcquire(pgtl->lock, LW_SHARED);
+		ok = TransactionIdIsNormal(pgtl->oldestSafeTs);
+		LWLockRelease(pgtl->lock);
+
+		if (!ok)
+		{
+			elog(ERROR, "No safe point is the past available yet");
+			return false;
+		}
 	}
 
 	if (IsTransactionBlock())
@@ -287,6 +487,15 @@ void pgtl_preventWrite(void)
 		XactReadOnly = true;
 		old_XactReadOnly_changed = true;
 	}
+	/* test without lock first */
+	else if (TransactionIdEquals(pgtl->oldestSafeTs, BootstrapTransactionId))
+	{
+		/* new test with the lock, and set value if needed */
+		LWLockAcquire(pgtl->lock, LW_EXCLUSIVE);
+		if (pgtl->oldestSafeTs == BootstrapTransactionId)
+			pgtl->oldestSafeTs = ReadNewTransactionId();
+		LWLockRelease(pgtl->lock);
+	}
 }
 
 void pgtl_restoreWrite(void)
@@ -296,6 +505,18 @@ void pgtl_restoreWrite(void)
 		XactReadOnly = old_XactReadOnly;
 		old_XactReadOnly_changed = false;
 	}
+}
+
+void
+pgtl_setOldestSafeTs(TransactionId newOldest)
+{
+	elog(WARNING, "set %d", newOldest);
+	Assert(TransactionIdIsValid(newOldest));
+	Assert(TransactionIdPrecedesOrEquals(pgtl->oldestSafeTs, newOldest));
+
+	LWLockAcquire(pgtl->lock, LW_EXCLUSIVE);
+	pgtl->oldestSafeTs = newOldest;
+	LWLockRelease(pgtl->lock);
 }
 
 bool
