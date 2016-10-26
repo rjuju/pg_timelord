@@ -731,27 +731,27 @@ HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 
 	Assert(TransactionIdIsValid(xmin));
 
-	if (!TransactionIdIsNormal(xmin)) /* frozen or bootstrap */
-		return true;
-
-	/* really inserted ? */
-	if (HeapTupleHeaderXminCommitted(tuple) && TransactionIdDidCommit(xmin))
+	if (TransactionIdIsNormal(xmin)) /* neither frozen or bootstrap */
 	{
-		TimestampTz insert_ts;
-
-		if (xmin != FrozenTransactionId)
+		/* really inserted ? */
+		if (HeapTupleHeaderXminCommitted(tuple) && TransactionIdDidCommit(xmin))
 		{
-			if (!TransactionIdGetCommitTsData(xmin, &insert_ts, NULL))
-				/* too old, too bad */
-				elog(ERROR, "You requested too old snapshot");
+			TimestampTz insert_ts;
 
-			if (timestamp_cmp_internal(pgtl_ts, insert_ts) <= 0)
-				/* not visible yet */
-				return false;
+			if (xmin != FrozenTransactionId)
+			{
+				if (!TransactionIdGetCommitTsData(xmin, &insert_ts, NULL))
+					/* too old, too bad */
+					elog(ERROR, "You requested too old snapshot");
+
+				if (timestamp_cmp_internal(pgtl_ts, insert_ts) <= 0)
+					/* not visible yet */
+					return false;
+			}
 		}
 	}
-
 	/* at this point, xmin has committed, what about xmax ? */
+
 	/* check hint bit first */
 	if ((tuple->t_infomask & HEAP_XMAX_COMMITTED) ||
 		/* check clog */
@@ -766,9 +766,12 @@ HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 				elog(ERROR, "You requested too old snapshot");
 
 			if (timestamp_cmp_internal(pgtl_ts, delete_ts) <= 0)
-				/* not visible yet */
+				/* not deleted yet */
 				return true;
+			else
+				return false;
 		}
 	}
+
 	return true;
 }
