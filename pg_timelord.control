@@ -1,0 +1,5 @@
+# pg_timelord extension
+comment = 'Enable time traveling'
+default_version = '0.0.1'
+module_pathname = '$libdir/pg_timelord'
+relocatable = true

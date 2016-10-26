@@ -73,6 +73,9 @@ void	_PG_fini(void);
 bool	check_pgtl_ts(char **newval, void **extra, GucSource source);
 void	assign_pgtl_ts(const char *newval, void *extra);
 
+PG_FUNCTION_INFO_V1(pg_timelord_oldest_xact);
+Datum	pg_timelord_oldest_xact(PG_FUNCTION_ARGS);
+
 static void pgtl_main(Datum main_arg);
 static void pgtl_shmem_startup(void);
 static void pgtl_shmem_shutdown(int code, Datum arg);
@@ -183,6 +186,18 @@ _PG_fini(void)
 	shmem_startup_hook = prev_shmem_startup_hook;
 	ExecutorStart_hook = prev_ExecutorStart;
 	ProcessUtility_hook = prev_ProcessUtility;
+}
+
+Datum
+pg_timelord_oldest_xact(PG_FUNCTION_ARGS)
+{
+	TransactionId xid;
+
+	LWLockAcquire(pgtl->lock, LW_SHARED);
+	xid = pgtl->oldestSafeXid;
+	LWLockRelease(pgtl->lock);
+
+	return TransactionIdGetDatum(xid);
 }
 
 static void
