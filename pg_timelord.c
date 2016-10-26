@@ -6,7 +6,7 @@
  * TODO:
  *   * add a GUC to prevent VACUUM from removing recent enough data
  *   * work harder on the satisfies function
- *   * reset oldestSafeXid is database changed, or handle multiple db
+ *   * handle multiple db for vacuum preventing?
  *   * verify it works
  *
  * This program is open source, licensed under the PostgreSQL license.
@@ -61,10 +61,15 @@ typedef struct pgtlSharedState
 {
 	LWLockId		lock;			/* protects counter modification */
 	TransactionId	oldestSafeXid;	/* oldest safe transactionid reachable */
+	int8			datname_len;
+	char			datname[NAMEDATALEN];
 } pgtlSharedState;
 
 /* Links to shared memory state */
 static pgtlSharedState *pgtl = NULL;
+
+/* flag set by bgworker signal handler */
+static volatile sig_atomic_t got_sigterm = false;
 
 /*--- Functions --- */
 
@@ -77,6 +82,7 @@ PG_FUNCTION_INFO_V1(pg_timelord_oldest_xact);
 Datum	pg_timelord_oldest_xact(PG_FUNCTION_ARGS);
 
 static void pgtl_main(Datum main_arg);
+static void pgtl_sigterm(SIGNAL_ARGS);
 static void pgtl_shmem_startup(void);
 static void pgtl_shmem_shutdown(int code, Datum arg);
 static void pgtl_ExecutorStart(QueryDesc *queryDesc, int eflags);
@@ -88,6 +94,7 @@ static void pgtl_ProcessUtility(Node *parsetree,
 void pgtl_preventWrite(void);
 void pgtl_restoreWrite(void);
 void pgtl_setoldestSafeXid(TransactionId newOldest);
+void pgtl_setdatname(int8 len, char *datname);
 bool HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 								Buffer buffer);
 
@@ -171,7 +178,7 @@ _PG_init(void)
 																 * database */
 	worker.bgw_main = pgtl_main;
 	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_timelord");
-	worker.bgw_restart_time = 1;
+	worker.bgw_restart_time = 3;
 	worker.bgw_main_arg = (Datum) 0;
 #if (PG_VERSION_NUM >= 90400)
 	worker.bgw_notify_pid = 0;
@@ -206,6 +213,10 @@ pgtl_main(Datum main_arg)
 	Snapshot	pgtl_snapshot;
 	char		msg[100];
 
+	/* Establish signal handler before unblocking signals. */
+	pqsignal(SIGTERM, pgtl_sigterm);
+
+	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
 	/* Connect to postgres database */
@@ -225,7 +236,7 @@ pgtl_main(Datum main_arg)
 	PushActiveSnapshot(pgtl_snapshot);
 	pgstat_report_activity(STATE_IDLEINTRANSACTION, "Setting up pg_timelord...");
 
-	for (;;)
+	while (!got_sigterm)
 	{
 		TransactionId xmin;
 
@@ -244,24 +255,39 @@ pgtl_main(Datum main_arg)
 		}
 
 		/* sleep 5 minutes */
-		WaitLatch(&MyProc->procLatch,
+		WaitLatch(MyLatch,
 				WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
 				300000
 #if PG_VERSION_NUM >= 100000
 				,PG_WAIT_EXTENSION
 #endif
 		);
-		ResetLatch(&MyProc->procLatch);
+		ResetLatch(MyLatch);
 	}
+
+	proc_exit(1);
+}
+
+static void
+pgtl_sigterm(SIGNAL_ARGS)
+{
+	int save_errno = errno;
+
+	got_sigterm = true;
+	SetLatch(MyLatch);
+
+	errno = save_errno;
 }
 
 static void
 pgtl_shmem_startup(void)
 {
-	bool		found;
-	FILE		*file;
-	uint32		header;
-	TransactionId temp_ts;
+	bool			found;
+	FILE		   *file;
+	uint32			header;
+	TransactionId	temp_ts;
+	int8			temp_len;
+	char			temp_datname[NAMEDATALEN];
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -306,9 +332,11 @@ pgtl_shmem_startup(void)
 		{
 			/*
 			 * no stat file, probably initialization. A safe xid will be set
-			 * at first query execution
+			 * at first query execution, save configured database as reference
+			 * database.
 			 */
 			pgtl_setoldestSafeXid(BootstrapTransactionId);
+			pgtl_setdatname(strlen(pgtl_database), pgtl_database);
 			return;			/* ignore not-found error */
 		}
 		goto error;
@@ -319,12 +347,27 @@ pgtl_shmem_startup(void)
 		header != PGTL_FILE_HEADER)
 		goto error;
 
-	/* read saved oldestSafeXid */
-	if (fread(&temp_ts, sizeof(TransactionId), 1, file) != 1)
+	/* read saved oldestSafeXid and datname */
+	if ((fread(&temp_ts, sizeof(TransactionId), 1, file) != 1) ||
+		(fread(&temp_len, sizeof(int8), 1, file) != 1) ||
+		(fread(&temp_datname, 1, temp_len + 1, file) != temp_len + 1))
 		goto error;
 
-	/* restore the oldest safe transaction id */
-	pgtl_setoldestSafeXid(temp_ts);
+	Assert(temp_len <= NAMEDATALEN);
+
+	/* detect if database changed */
+	if (strcmp(pgtl_database, temp_datname) != 0)
+	{
+		/* database changed, force new safe xid */
+		pgtl_setoldestSafeXid(BootstrapTransactionId);
+	}
+	else
+	{
+		/* restore the oldest safe transaction id */
+		pgtl_setoldestSafeXid(temp_ts);
+	}
+	/* save reference database in shmem */
+	pgtl_setdatname(temp_len, temp_datname);
 
 	FreeFile(file);
 	/*
@@ -362,10 +405,10 @@ pgtl_shmem_shutdown(int code, Datum arg)
 	if (file == NULL)
 		goto error;
 
-	if (fwrite(&PGTL_FILE_HEADER, sizeof(uint32), 1, file) != 1)
-		goto error;
-
-	if (fwrite(&pgtl->oldestSafeXid, sizeof(TransactionId), 1, file) != 1)
+	if ((fwrite(&PGTL_FILE_HEADER, sizeof(uint32), 1, file) != 1) ||
+		(fwrite(&pgtl->oldestSafeXid, sizeof(TransactionId), 1, file) != 1) ||
+		(fwrite(&pgtl->datname_len, sizeof(int8), 1, file) != 1) ||
+		(fwrite(&pgtl->datname, 1, pgtl->datname_len + 1, file) != pgtl->datname_len + 1))
 		goto error;
 
 	if (FreeFile(file))
@@ -388,7 +431,7 @@ pgtl_shmem_shutdown(int code, Datum arg)
 error:
 	ereport(LOG,
 			(errcode_for_file_access(),
-			 errmsg("could not read pg_timelord file \"%s\": %m",
+			 errmsg("could not write pg_timelord file \"%s\": %m",
 					PGTL_DUMP_FILE)));
 
 	if (file)
@@ -607,7 +650,10 @@ void pgtl_preventWrite(void)
 		/* new test with the lock, and set value if needed */
 		LWLockAcquire(pgtl->lock, LW_EXCLUSIVE);
 		if (pgtl->oldestSafeXid == BootstrapTransactionId)
+		{
 			pgtl->oldestSafeXid = ReadNewTransactionId();
+			elog(LOG, "new safe xid set: %u", pgtl->oldestSafeXid);
+		}
 		LWLockRelease(pgtl->lock);
 	}
 }
@@ -627,8 +673,20 @@ pgtl_setoldestSafeXid(TransactionId newOldest)
 	Assert(TransactionIdIsValid(newOldest));
 	Assert(TransactionIdPrecedesOrEquals(pgtl->oldestSafeXid, newOldest));
 
+	if (TransactionIdEquals(newOldest, BootstrapTransactionId))
+		elog(WARNING, "Forcing new safe xid at next transaction");
+
 	LWLockAcquire(pgtl->lock, LW_EXCLUSIVE);
 	pgtl->oldestSafeXid = newOldest;
+	LWLockRelease(pgtl->lock);
+}
+
+void pgtl_setdatname(int8 len, char *datname)
+{
+	LWLockAcquire(pgtl->lock, LW_EXCLUSIVE);
+	pgtl->datname_len = len;
+	if (len > 0)
+		strncpy(pgtl->datname, datname, len + 1);
 	LWLockRelease(pgtl->lock);
 }
 
