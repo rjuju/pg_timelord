@@ -4,7 +4,6 @@
  * Enable time traveling.
  *
  * TODO:
- *   * add a GUC to prevent VACUUM from removing recent enough data
  *   * work harder on the satisfies function
  *   * handle multiple db for vacuum preventing?
  *   * verify it works
@@ -91,11 +90,13 @@ static void pgtl_ProcessUtility(Node *parsetree,
 		ParamListInfo params,
 		DestReceiver *dest, char *completionTag);
 
-void pgtl_preventWrite(void);
-void pgtl_restoreWrite(void);
-void pgtl_setoldestSafeXid(TransactionId newOldest);
-void pgtl_setdatname(int8 len, char *datname);
-bool HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
+static void pgtl_initOldestSafeXid(void);
+static void pgtl_preventWrite(void);
+static void pgtl_restoreWrite(void);
+static void pgtl_setoldestSafeXid(TransactionId newOldest);
+static TransactionId pgtl_getOldestSafeXid(void);
+static void pgtl_setdatname(int8 len, char *datname);
+static bool HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 								Buffer buffer);
 
 static char *pgtl_ts_char;
@@ -198,20 +199,15 @@ _PG_fini(void)
 Datum
 pg_timelord_oldest_xact(PG_FUNCTION_ARGS)
 {
-	TransactionId xid;
-
-	LWLockAcquire(pgtl->lock, LW_SHARED);
-	xid = pgtl->oldestSafeXid;
-	LWLockRelease(pgtl->lock);
-
-	return TransactionIdGetDatum(xid);
+	return TransactionIdGetDatum(pgtl_getOldestSafeXid());
 }
 
 static void
 pgtl_main(Datum main_arg)
 {
-	Snapshot	pgtl_snapshot;
-	char		msg[100];
+	TransactionId	cur_xmin;
+	Snapshot		pgtl_snapshot;
+	char			msg[100];
 
 	/* Establish signal handler before unblocking signals. */
 	pqsignal(SIGTERM, pgtl_sigterm);
@@ -222,7 +218,7 @@ pgtl_main(Datum main_arg)
 	/* Connect to postgres database */
 	BackgroundWorkerInitializeConnection(pgtl_database, NULL);
 
-	elog(LOG, "pg_timelord connected");
+	elog(LOG, "pg_timelord VACUUM preventer© connected on database \"%s\"", pgtl_database);
 
 	set_ps_display("init", false);
 	StartTransactionCommand();
@@ -236,21 +232,34 @@ pgtl_main(Datum main_arg)
 	PushActiveSnapshot(pgtl_snapshot);
 	pgstat_report_activity(STATE_IDLEINTRANSACTION, "Setting up pg_timelord...");
 
+	/* detect if new safe xid is needed */
+	pgtl_initOldestSafeXid();
+	cur_xmin = pgtl_getOldestSafeXid();
+	Assert(TransactionIdIsNormal(cur_xmin));
+
 	while (!got_sigterm)
 	{
-		TransactionId xmin;
+		TransactionId new_xmin;
 
-		xmin = ReadNewTransactionId() - pgtl_keep_xact;
-		if (!TransactionIdIsNormal(xmin))
-			xmin = FirstNormalTransactionId;
+		new_xmin = ReadNewTransactionId() - pgtl_keep_xact;
 
-		if (pgtl_snapshot->xmin != xmin)
+		/* make sure we get a normal xid */
+		if (!TransactionIdIsNormal(new_xmin))
+			new_xmin = FirstNormalTransactionId;
+
+		/* don't go further in the past that what we can */
+		if (TransactionIdPrecedes(new_xmin, cur_xmin))
+				new_xmin = cur_xmin;
+
+		if (pgtl_snapshot->xmin != new_xmin)
 		{
-			pgtl_snapshot->xmin = xmin;
+			pgtl_snapshot->xmin = new_xmin;
 			PopActiveSnapshot();
 			PushActiveSnapshot(pgtl_snapshot);
-			ProcArrayInstallImportedXmin(xmin, GetTopTransactionId());
-			sprintf(msg, "oldest unvacuumed xid: %u", xmin);
+			ProcArrayInstallImportedXmin(new_xmin, GetTopTransactionId());
+			pgtl_setoldestSafeXid(new_xmin);
+			cur_xmin = new_xmin;
+			sprintf(msg, "oldest unvacuumed xid: %u", new_xmin);
 			pgstat_report_activity(STATE_IDLEINTRANSACTION, msg);
 		}
 
@@ -462,9 +471,7 @@ check_pgtl_ts(char **newval, void **extra, GucSource source)
 	{
 		/* shmem avail and asked for ts, let's check a safe xid exists first */
 
-		LWLockAcquire(pgtl->lock, LW_SHARED);
-		oldest = pgtl->oldestSafeXid;
-		LWLockRelease(pgtl->lock);
+		oldest = pgtl_getOldestSafeXid();
 
 		if (!TransactionIdIsNormal(oldest))
 		{
@@ -636,7 +643,25 @@ pgtl_ProcessUtility(Node *parsetree,
 	pgtl_restoreWrite();
 }
 
-void pgtl_preventWrite(void)
+static void
+pgtl_initOldestSafeXid(void)
+{
+	/* test without lock first */
+	if (TransactionIdEquals(pgtl->oldestSafeXid, BootstrapTransactionId))
+	{
+		/* new test with the lock, and set value if needed */
+		LWLockAcquire(pgtl->lock, LW_EXCLUSIVE);
+		if (pgtl->oldestSafeXid == BootstrapTransactionId)
+		{
+			pgtl->oldestSafeXid = ReadNewTransactionId();
+			elog(WARNING, "new safe xid set: %u", pgtl->oldestSafeXid);
+		}
+		LWLockRelease(pgtl->lock);
+	}
+}
+
+static void
+pgtl_preventWrite(void)
 {
 	if (pgtl_ts != 0)
 	{
@@ -644,21 +669,13 @@ void pgtl_preventWrite(void)
 		XactReadOnly = true;
 		old_XactReadOnly_changed = true;
 	}
-	/* test without lock first */
-	else if (TransactionIdEquals(pgtl->oldestSafeXid, BootstrapTransactionId))
-	{
-		/* new test with the lock, and set value if needed */
-		LWLockAcquire(pgtl->lock, LW_EXCLUSIVE);
-		if (pgtl->oldestSafeXid == BootstrapTransactionId)
-		{
-			pgtl->oldestSafeXid = ReadNewTransactionId();
-			elog(LOG, "new safe xid set: %u", pgtl->oldestSafeXid);
-		}
-		LWLockRelease(pgtl->lock);
-	}
+	else
+		/* bgworker should have done it already */
+		pgtl_initOldestSafeXid();
 }
 
-void pgtl_restoreWrite(void)
+static void
+pgtl_restoreWrite(void)
 {
 	if (old_XactReadOnly_changed)
 	{
@@ -667,7 +684,7 @@ void pgtl_restoreWrite(void)
 	}
 }
 
-void
+static void
 pgtl_setoldestSafeXid(TransactionId newOldest)
 {
 	Assert(TransactionIdIsValid(newOldest));
@@ -681,7 +698,20 @@ pgtl_setoldestSafeXid(TransactionId newOldest)
 	LWLockRelease(pgtl->lock);
 }
 
-void pgtl_setdatname(int8 len, char *datname)
+static TransactionId
+pgtl_getOldestSafeXid(void)
+{
+	TransactionId xmin;
+
+	LWLockAcquire(pgtl->lock, LW_SHARED);
+	xmin = pgtl->oldestSafeXid;
+	LWLockRelease(pgtl->lock);
+
+	return xmin;
+}
+
+static void
+pgtl_setdatname(int8 len, char *datname)
 {
 	LWLockAcquire(pgtl->lock, LW_EXCLUSIVE);
 	pgtl->datname_len = len;
@@ -690,7 +720,7 @@ void pgtl_setdatname(int8 len, char *datname)
 	LWLockRelease(pgtl->lock);
 }
 
-bool
+static bool
 HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 					   Buffer buffer)
 {
