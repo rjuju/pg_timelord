@@ -83,6 +83,7 @@ bool HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 
 static char *pgtl_ts_char;
 static TimestampTz pgtl_ts = 0;
+static int  pgtl_keep_xact;
 static bool old_XactReadOnly;
 static bool old_XactReadOnly_changed = false;
 
@@ -125,6 +126,19 @@ _PG_init(void)
 							 check_pgtl_ts,
 							 assign_pgtl_ts,
 							 NULL);
+
+	DefineCustomIntVariable("pg_timelord.keep_xact",
+							"Defines the number of transaction to prevent from cleaning",
+							NULL,
+							&pgtl_keep_xact,
+							200000000,
+							-1,
+							1000000000,
+							PGC_SUSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
 }
 
 void
