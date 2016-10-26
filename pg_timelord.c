@@ -6,6 +6,7 @@
  * TODO:
  *   * add a GUC to prevent VACUUM from removing recent enough data
  *   * work harder on the satisfies function
+ *   * reset oldestSafeXid is database changed, or handle multiple db
  *   * verify it works
  *
  * This program is open source, licensed under the PostgreSQL license.
@@ -21,15 +22,20 @@
 #include "access/xact.h"
 #include "datatype/timestamp.h"
 #include "executor/executor.h"
+#include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "pgstat.h"
+#include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/procarray.h"
 #include "storage/shmem.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
-#include "utils/snapshot.h"
+#include "utils/ps_status.h"
+#include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 #include "utils/tqual.h"
 
@@ -67,6 +73,7 @@ void	_PG_fini(void);
 bool	check_pgtl_ts(char **newval, void **extra, GucSource source);
 void	assign_pgtl_ts(const char *newval, void *extra);
 
+static void pgtl_main(Datum main_arg);
 static void pgtl_shmem_startup(void);
 static void pgtl_shmem_shutdown(int code, Datum arg);
 static void pgtl_ExecutorStart(QueryDesc *queryDesc, int eflags);
@@ -83,6 +90,7 @@ bool HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 
 static char *pgtl_ts_char;
 static TimestampTz pgtl_ts = 0;
+static char *pgtl_database;
 static int  pgtl_keep_xact;
 static bool old_XactReadOnly;
 static bool old_XactReadOnly_changed = false;
@@ -90,6 +98,8 @@ static bool old_XactReadOnly_changed = false;
 void
 _PG_init(void)
 {
+	BackgroundWorker worker;
+
 	if (!process_shared_preload_libraries_in_progress)
 	{
 		elog(ERROR, "This module can only be loaded via shared_preload_libraries");
@@ -127,6 +137,17 @@ _PG_init(void)
 							 assign_pgtl_ts,
 							 NULL);
 
+	DefineCustomStringVariable("pg_timelord.database",
+							   "Defines the database on which prevent VACUUM",
+							   NULL,
+							   &pgtl_database,
+							   "postgres",
+							   PGC_POSTMASTER,
+							   0,
+							   NULL,
+							   NULL,
+							   NULL);
+
 	DefineCustomIntVariable("pg_timelord.keep_xact",
 							"Defines the number of transaction to prevent from cleaning",
 							NULL,
@@ -139,6 +160,20 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
+
+	/* Register the worker processes */
+	worker.bgw_flags =
+		BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;		/* Must write to the
+																 * database */
+	worker.bgw_main = pgtl_main;
+	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_timelord");
+	worker.bgw_restart_time = 1;
+	worker.bgw_main_arg = (Datum) 0;
+#if (PG_VERSION_NUM >= 90400)
+	worker.bgw_notify_pid = 0;
+#endif
+	RegisterBackgroundWorker(&worker);
 }
 
 void
@@ -148,6 +183,61 @@ _PG_fini(void)
 	shmem_startup_hook = prev_shmem_startup_hook;
 	ExecutorStart_hook = prev_ExecutorStart;
 	ProcessUtility_hook = prev_ProcessUtility;
+}
+
+static void
+pgtl_main(Datum main_arg)
+{
+	Snapshot	pgtl_snapshot;
+	char		msg[100];
+
+	BackgroundWorkerUnblockSignals();
+
+	/* Connect to postgres database */
+	BackgroundWorkerInitializeConnection(pgtl_database, NULL);
+
+	elog(LOG, "pg_timelord connected");
+
+	set_ps_display("init", false);
+	StartTransactionCommand();
+	SPI_connect();
+
+	/* There doesn't seem to a nice API to set these */
+	XactIsoLevel = XACT_REPEATABLE_READ;
+	//XactReadOnly = true;
+
+	pgtl_snapshot = GetTransactionSnapshot();
+	PushActiveSnapshot(pgtl_snapshot);
+	pgstat_report_activity(STATE_IDLEINTRANSACTION, "Setting up pg_timelord...");
+
+	for (;;)
+	{
+		TransactionId xmin;
+
+		xmin = ReadNewTransactionId() - pgtl_keep_xact;
+		if (!TransactionIdIsNormal(xmin))
+			xmin = FirstNormalTransactionId;
+
+		if (pgtl_snapshot->xmin != xmin)
+		{
+			pgtl_snapshot->xmin = xmin;
+			PopActiveSnapshot();
+			PushActiveSnapshot(pgtl_snapshot);
+			ProcArrayInstallImportedXmin(xmin, GetTopTransactionId());
+			sprintf(msg, "oldest unvacuumed xid: %u", xmin);
+			pgstat_report_activity(STATE_IDLEINTRANSACTION, msg);
+		}
+
+		/* sleep 5 minutes */
+		WaitLatch(&MyProc->procLatch,
+				WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+				300000
+#if PG_VERSION_NUM >= 100000
+				,PG_WAIT_EXTENSION
+#endif
+		);
+		ResetLatch(&MyProc->procLatch);
+	}
 }
 
 static void
