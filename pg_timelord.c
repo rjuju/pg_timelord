@@ -6,7 +6,6 @@
  * TODO:
  *   * work harder on the satisfies function
  *   * handle multiple db for vacuum preventing?
- *   * write permanent stat file in bgworker before advancing oldestSafeXid
  *   * verify it works
  *
  * This program is open source, licensed under the PostgreSQL license.
@@ -100,6 +99,7 @@ static void pgtl_ProcessUtility(Node *parsetree,
 static void pgtl_initOldestSafeXid(void);
 static void pgtl_preventWrite(void);
 static void pgtl_restoreWrite(void);
+static bool pgtl_saveShmemState(bool need_lock);
 static void pgtl_setoldestSafeXid(TransactionId newOldest);
 static TransactionId pgtl_getOldestSafeXid(void);
 static void pgtl_setdatname(int8 len, char *datname);
@@ -266,8 +266,9 @@ pgtl_main(Datum main_arg)
 			pgtl_snapshot->xmin = new_xmin;
 			PopActiveSnapshot();
 			PushActiveSnapshot(pgtl_snapshot);
-			ProcArrayInstallImportedXmin(new_xmin, GetTopTransactionId());
 			pgtl_setoldestSafeXid(new_xmin);
+			pgtl_saveShmemState(true);
+			ProcArrayInstallImportedXmin(new_xmin, GetTopTransactionId());
 			cur_xmin = new_xmin;
 			sprintf(msg, "oldest unvacuumed xid: %u", new_xmin);
 			pgstat_report_activity(STATE_IDLEINTRANSACTION, msg);
@@ -389,11 +390,12 @@ pgtl_shmem_startup(void)
 	pgtl_setdatname(temp_len, temp_datname);
 
 	FreeFile(file);
+
 	/*
-	 * Remove the file so it's not included in backups/replication slaves,
-	 * etc. A new file will be written on next shutdown.
+	 * Don't remove the file so it's included in backups/replication slaves,
+	 * etc. This file will be rewritten as needed by the background worker or
+	 * during shutdown
 	 */
-	unlink(PGTL_DUMP_FILE);
 
 	return;
 
@@ -411,8 +413,6 @@ error:
 static void
 pgtl_shmem_shutdown(int code, Datum arg)
 {
-	FILE	*file;
-
 	/* Don't try to dump during a crash. */
 	if (code)
 		return;
@@ -420,42 +420,8 @@ pgtl_shmem_shutdown(int code, Datum arg)
 	if (!pgtl)
 		return;
 
-	file = AllocateFile(PGTL_DUMP_FILE ".tmp", PG_BINARY_W);
-	if (file == NULL)
-		goto error;
-
-	if ((fwrite(&PGTL_FILE_HEADER, sizeof(uint32), 1, file) != 1) ||
-		(fwrite(&pgtl->oldestSafeXid, sizeof(TransactionId), 1, file) != 1) ||
-		(fwrite(&pgtl->datname_len, sizeof(int8), 1, file) != 1) ||
-		(fwrite(&pgtl->datname, 1, pgtl->datname_len + 1, file) != pgtl->datname_len + 1))
-		goto error;
-
-	if (FreeFile(file))
-	{
-		file = NULL;
-		goto error;
-	}
-
-	/*
-	 * Rename file inplace
-	 */
-	if (rename(PGTL_DUMP_FILE ".tmp", PGTL_DUMP_FILE) != 0)
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not rename pg_timelord file \"%s\": %m",
-						PGTL_DUMP_FILE ".tmp")));
-
-	return;
-
-error:
-	ereport(LOG,
-			(errcode_for_file_access(),
-			 errmsg("could not write pg_timelord file \"%s\": %m",
-					PGTL_DUMP_FILE)));
-
-	if (file)
-		FreeFile(file);
-	unlink(PGTL_DUMP_FILE);
+	/* no lock here */
+	pgtl_saveShmemState(false);
 }
 
 bool
@@ -722,6 +688,73 @@ pgtl_restoreWrite(void)
 		XactReadOnly = old_XactReadOnly;
 		old_XactReadOnly_changed = false;
 	}
+}
+
+/* callse must take care of taking the lock */
+static bool
+pgtl_saveShmemState(bool need_lock)
+{
+	FILE   *file;
+	bool	lock_taken = false;
+
+	if (!pgtl)
+		return false;
+
+	if (need_lock)
+	{
+		LWLockAcquire(pgtl->lock, LW_SHARED);
+		lock_taken = true;
+	}
+
+	file = AllocateFile(PGTL_DUMP_FILE ".tmp", PG_BINARY_W);
+	if (file == NULL)
+		goto error;
+
+	if ((fwrite(&PGTL_FILE_HEADER, sizeof(uint32), 1, file) != 1) ||
+		(fwrite(&pgtl->oldestSafeXid, sizeof(TransactionId), 1, file) != 1) ||
+		(fwrite(&pgtl->datname_len, sizeof(int8), 1, file) != 1) ||
+		(fwrite(&pgtl->datname, 1, pgtl->datname_len + 1, file) != pgtl->datname_len + 1))
+		goto error;
+
+	if (FreeFile(file))
+	{
+		file = NULL;
+		goto error;
+	}
+
+	/*
+	 * Remove old file and rename file inplace
+	 */
+	unlink(PGTL_DUMP_FILE);
+	/* if crash happens here, you're really not lucky */
+	if (rename(PGTL_DUMP_FILE ".tmp", PGTL_DUMP_FILE) != 0)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not rename pg_timelord file \"%s\": %m",
+						PGTL_DUMP_FILE ".tmp")));
+
+		goto error;
+	}
+
+	if (need_lock && lock_taken)
+		LWLockRelease(pgtl->lock);
+
+	return true;
+
+error:
+	ereport(LOG,
+			(errcode_for_file_access(),
+			 errmsg("could not write pg_timelord file \"%s\": %m",
+					PGTL_DUMP_FILE)));
+
+	if (file)
+		FreeFile(file);
+	unlink(PGTL_DUMP_FILE);
+
+	if (lock_taken)
+		LWLockRelease(pgtl->lock);
+	return false;
 }
 
 static void
