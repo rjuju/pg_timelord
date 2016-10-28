@@ -6,6 +6,7 @@
  * TODO:
  *   * work harder on the satisfies function
  *   * handle multiple db for vacuum preventing?
+ *   * write permanent stat file in bgworker before advancing oldestSafeXid
  *   * verify it works
  *
  * This program is open source, licensed under the PostgreSQL license.
