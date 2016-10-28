@@ -25,6 +25,8 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "optimizer/cost.h"
+#include "optimizer/planner.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -50,6 +52,7 @@ PG_MODULE_MAGIC;
 static const uint32 PGTL_FILE_HEADER = 0x20161025;
 
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static planner_hook_type prev_planner_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 
@@ -84,6 +87,9 @@ static void pgtl_main(Datum main_arg);
 static void pgtl_sigterm(SIGNAL_ARGS);
 static void pgtl_shmem_startup(void);
 static void pgtl_shmem_shutdown(int code, Datum arg);
+static PlannedStmt *pgtl_planner(Query *parse,
+								 int cursorOptions,
+								 ParamListInfo boundParams);
 static void pgtl_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void pgtl_ProcessUtility(Node *parsetree,
 		const char *queryString, ProcessUtilityContext context,
@@ -132,6 +138,8 @@ _PG_init(void)
 	/* Install hook */
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pgtl_shmem_startup;
+	prev_planner_hook = planner_hook;
+	planner_hook = pgtl_planner;
 	prev_ExecutorStart = ExecutorStart_hook;
 	ExecutorStart_hook = pgtl_ExecutorStart;
 	prev_ProcessUtility = ProcessUtility_hook;
@@ -192,6 +200,7 @@ _PG_fini(void)
 {
 	/* uninstall hook */
 	shmem_startup_hook = prev_shmem_startup_hook;
+	planner_hook = prev_planner_hook;
 	ExecutorStart_hook = prev_ExecutorStart;
 	ProcessUtility_hook = prev_ProcessUtility;
 }
@@ -534,6 +543,30 @@ void
 assign_pgtl_ts(const char *newval, void *extra)
 {
 	pgtl_ts = *((TimestampTz *) extra);
+}
+
+static PlannedStmt *pgtl_planner(Query *parse,
+								 int cursorOptions,
+								 ParamListInfo boundParams)
+{
+	PlannedStmt *result;
+	bool prev_enable_bitmapscan = enable_bitmapscan;
+
+	/*
+	 * bitmap scan does not support non-core MVCC snapshot, see Assert in
+	 * ExecInitBitmapHeapScan() and comment at top of nodeBitmapHeapscan.c
+	 */
+	enable_bitmapscan = false;
+
+	if (prev_planner_hook)
+		result = (*prev_planner_hook) (parse, cursorOptions, boundParams);
+	else
+		result = standard_planner(parse, cursorOptions, boundParams);
+
+	/* restore enable_bitmapscan */
+	enable_bitmapscan = prev_enable_bitmapscan;
+
+	return result;
 }
 
 static void
