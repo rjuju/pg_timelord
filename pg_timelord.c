@@ -552,20 +552,26 @@ static PlannedStmt *pgtl_planner(Query *parse,
 {
 	PlannedStmt *result;
 	bool prev_enable_bitmapscan = enable_bitmapscan;
+	bool prev_enable_indexonlyscan = enable_indexonlyscan;
 
 	/*
 	 * bitmap scan does not support non-core MVCC snapshot, see Assert in
 	 * ExecInitBitmapHeapScan() and comment at top of nodeBitmapHeapscan.c
 	 */
 	enable_bitmapscan = false;
+	/* index-only scan does not support non-core MVCC snapshot, see comment
+	 * above the elog(ERROR) in IndexOnlyNext()
+	 */
+	enable_indexonlyscan = false;
 
 	if (prev_planner_hook)
 		result = (*prev_planner_hook) (parse, cursorOptions, boundParams);
 	else
 		result = standard_planner(parse, cursorOptions, boundParams);
 
-	/* restore enable_bitmapscan */
+	/* restore planner parameters */
 	enable_bitmapscan = prev_enable_bitmapscan;
+	enable_indexonlyscan = prev_enable_indexonlyscan;
 
 	return result;
 }
