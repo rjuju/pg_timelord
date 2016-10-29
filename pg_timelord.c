@@ -632,15 +632,13 @@ pgtl_ProcessUtility(Node *parsetree,
 		}
 	}
 
-	/* forbid explicit VACUUM FREEZE, there's no way to modify oldest xact */
 	if (IsA(parsetree, VacuumStmt))
 	{
 		VacuumStmt *vacstmt = (VacuumStmt *) parsetree;
 
-		if (vacstmt->options & VACOPT_FREEZE)
-			elog(ERROR, "Explicit VACUUM FREEZE is disabled!");
-
-		/* XXX disble CLUSTER and VACUUM FULL too? */
+		if (vacstmt->options & VACOPT_VERBOSE)
+			elog(NOTICE, "pg_timelord is blocking VACUUM for xid >= %u",
+					pgtl_getOldestSafeXid());
 	}
 
 	if (prev_ProcessUtility)
