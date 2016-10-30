@@ -808,26 +808,27 @@ HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 
 	Assert(TransactionIdIsValid(xmin));
 
-	if (TransactionIdIsNormal(xmin)) /* neither frozen or bootstrap */
+	/* frozen and bootstrap xid are always visible */
+	if (TransactionIdIsNormal(xmin) && (!HeapTupleHeaderXminFrozen(tuple)))
 	{
 		/* really inserted ? */
 		if (HeapTupleHeaderXminCommitted(tuple) && TransactionIdDidCommit(xmin))
 		{
 			TimestampTz insert_ts;
 
-			if (xmin != FrozenTransactionId)
-			{
-				if (!TransactionIdGetCommitTsData(xmin, &insert_ts, NULL))
-					/* too old, too bad */
-					elog(ERROR, "You requested too old snapshot");
+			if (!TransactionIdGetCommitTsData(xmin, &insert_ts, NULL))
+				/* too old, too bad */
+				elog(ERROR, "You requested too old snapshot");
 
-				if (timestamp_cmp_internal(pgtl_ts, insert_ts) <= 0)
-					/* not visible yet */
-					return false;
-			}
+			if (timestamp_cmp_internal(insert_ts, pgtl_ts) > 0)
+				/* line created after requested ts */
+				return false;
 		}
+		else /* line was never inserted */
+			return false;
 	}
-	/* at this point, xmin has committed, what about xmax ? */
+
+	/* at this point, xmin has committed and is visible, what about xmax ? */
 
 	/* check hint bit first */
 	if ((tuple->t_infomask & HEAP_XMAX_COMMITTED) ||
@@ -836,14 +837,15 @@ HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 	{
 		TimestampTz delete_ts;
 
+		/* I think this test is stupid */
 		if (xmax != FrozenTransactionId)
 		{
 			if (!TransactionIdGetCommitTsData(xmax, &delete_ts, NULL))
 				/* too old, too bad */
 				elog(ERROR, "You requested too old snapshot");
 
-			if (timestamp_cmp_internal(pgtl_ts, delete_ts) <= 0)
-				/* not deleted yet */
+			if (timestamp_cmp_internal(delete_ts, pgtl_ts) > 0)
+				/* line deleted after requested ts */
 				return true;
 			else
 				return false;
