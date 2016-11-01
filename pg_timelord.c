@@ -830,6 +830,13 @@ HeapTupleSatisfiesTimeLord(HeapTuple htup, Snapshot snapshot,
 
 	/* at this point, xmin has committed and is visible, what about xmax ? */
 
+	/*
+	 * quick exit if no xmax, probably not needed since HEAP_XMAX_COMMITTED
+	 * should not be true
+	 */
+	if (!TransactionIdIsValid(xmax))
+			return true;
+
 	/* check hint bit first */
 	if ((tuple->t_infomask & HEAP_XMAX_COMMITTED) ||
 		/* check clog */
