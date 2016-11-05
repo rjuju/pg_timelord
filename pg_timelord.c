@@ -215,8 +215,7 @@ pg_timelord_oldest_xact(PG_FUNCTION_ARGS)
 static void
 pgtl_main(Datum main_arg)
 {
-	TransactionId	cur_xmin;
-	Snapshot		pgtl_snapshot;
+	Snapshot		pgtl_snap;
 	char			msg[100];
 
 	/* Establish signal handler before unblocking signals. */
@@ -236,19 +235,22 @@ pgtl_main(Datum main_arg)
 
 	/* There doesn't seem to a nice API to set these */
 	XactIsoLevel = XACT_REPEATABLE_READ;
-	//XactReadOnly = true;
+	XactReadOnly = true;
 
-	pgtl_snapshot = GetTransactionSnapshot();
-	PushActiveSnapshot(pgtl_snapshot);
-	pgstat_report_activity(STATE_IDLEINTRANSACTION, "Setting up pg_timelord...");
+	pgtl_snap = GetTransactionSnapshot();
 
 	/* detect if new safe xid is needed */
 	pgtl_initOldestSafeXid();
-	cur_xmin = pgtl_getOldestSafeXid();
-	Assert(TransactionIdIsNormal(cur_xmin));
+	pgtl_snap->xmin = pgtl_getOldestSafeXid();
+	Assert(TransactionIdIsNormal(pgtl_getOldestSafeXid()));
+
+	/* start by setting up previous kept xid */
+	PushActiveSnapshot(pgtl_snap);
+	pgstat_report_activity(STATE_IDLEINTRANSACTION, "Setting up pg_timelord...");
 
 	while (!got_sigterm)
 	{
+		SnapshotData snap_tmp;
 		TransactionId new_xmin;
 
 		new_xmin = ReadNewTransactionId() - pgtl_keep_xact;
@@ -257,19 +259,35 @@ pgtl_main(Datum main_arg)
 		if (!TransactionIdIsNormal(new_xmin))
 			new_xmin = FirstNormalTransactionId;
 
-		/* don't go further in the past that what we can */
-		if (TransactionIdPrecedes(new_xmin, cur_xmin))
-				new_xmin = cur_xmin;
-
-		if (pgtl_snapshot->xmin != new_xmin)
+		/* make sure this xid is older than any active xid */
+		/* TODO: make sure we don't get the bgworker xmin... */
+		GetSnapshotData(&snap_tmp);
+		if (TransactionIdPrecedes(snap_tmp.xmin, new_xmin))
 		{
-			pgtl_snapshot->xmin = new_xmin;
+			new_xmin = snap_tmp.xmin;
+			TransactionIdRetreat(new_xmin);
+		}
+
+		/*
+		 * get a committed xid. This loop could take a long time if your
+		 * application sucks (ie. does a lot of rollback), but you'd deserve it
+		 */
+		while(TransactionIdPrecedes(pgtl_snap->xmin, new_xmin) &&
+			  !TransactionIdDidCommit(new_xmin))
+			TransactionIdRetreat(new_xmin);
+
+		/* don't go further in the past that what we can */
+		if (TransactionIdPrecedes(new_xmin, pgtl_snap->xmin))
+				new_xmin = pgtl_snap->xmin;
+
+		if (pgtl_snap->xmin != new_xmin)
+		{
+			pgtl_snap->xmin = new_xmin;
 			PopActiveSnapshot();
-			PushActiveSnapshot(pgtl_snapshot);
+			PushActiveSnapshot(pgtl_snap);
 			pgtl_setoldestSafeXid(new_xmin);
 			pgtl_saveShmemState(true);
 			ProcArrayInstallImportedXmin(new_xmin, GetTopTransactionId());
-			cur_xmin = new_xmin;
 			sprintf(msg, "oldest unvacuumed xid: %u", new_xmin);
 			pgstat_report_activity(STATE_IDLEINTRANSACTION, msg);
 		}
