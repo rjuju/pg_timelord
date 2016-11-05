@@ -250,7 +250,11 @@ pgtl_main(Datum main_arg)
 
 	while (!got_sigterm)
 	{
-		SnapshotData snap_tmp;
+		/*
+		 * this has to be declared as static (see the hack in GetSnapshotData
+		 * to avoid repeated malloc/free).
+		 */
+		static SnapshotData snap_tmp;
 		TransactionId new_xmin;
 
 		new_xmin = ReadNewTransactionId() - pgtl_keep_xact;
