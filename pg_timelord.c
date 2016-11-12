@@ -287,16 +287,21 @@ pgtl_main(Datum main_arg)
 		if (pgtl_snap->xmin != new_xmin)
 		{
 			pgtl_snap->xmin = new_xmin;
-			PopActiveSnapshot();
-			PushActiveSnapshot(pgtl_snap);
+			/* these should be unneded, XXX check */
+			//PopActiveSnapshot();
+			//PushActiveSnapshot(pgtl_snap);
 			pgtl_setoldestSafeXid(new_xmin);
-			pgtl_saveShmemState(true);
+			if (!pgtl_saveShmemState(true))
+				/* XXX should try again or check why it failed? */
+				elog(WARNING, "could not save pg_timelord shmstate");
+
 			if (!ProcArrayInstallImportedXmin(new_xmin, GetTopTransactionId()))
 			{
 				/* this shouldn't happen unless xmin goes forward */
 				elog(PANIC, "error during ProcArrayInstallImportedXmin,"
 						" new_xmin: %d", new_xmin);
 			}
+
 			sprintf(msg, "oldest unvacuumed xid: %u", new_xmin);
 			pgstat_report_activity(STATE_IDLEINTRANSACTION, msg);
 		}
