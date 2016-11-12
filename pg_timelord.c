@@ -291,7 +291,12 @@ pgtl_main(Datum main_arg)
 			PushActiveSnapshot(pgtl_snap);
 			pgtl_setoldestSafeXid(new_xmin);
 			pgtl_saveShmemState(true);
-			ProcArrayInstallImportedXmin(new_xmin, GetTopTransactionId());
+			if (!ProcArrayInstallImportedXmin(new_xmin, GetTopTransactionId()))
+			{
+				/* this shouldn't happen unless xmin goes forward */
+				elog(PANIC, "error during ProcArrayInstallImportedXmin,"
+						" new_xmin: %d", new_xmin);
+			}
 			sprintf(msg, "oldest unvacuumed xid: %u", new_xmin);
 			pgstat_report_activity(STATE_IDLEINTRANSACTION, msg);
 		}
