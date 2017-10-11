@@ -6,6 +6,9 @@ Features
 
 A timelord to let you go back in time!
 
+**WARNING** : This extension is a proof of concept, and not intended for
+production use.
+
 Installation
 ============
 
@@ -46,5 +49,5 @@ License
 
 pg_timelord is free software distributed under the PostgreSQL license.
 
-Copyright (c) 2016, Julien Rouhaud.
+Copyright (c) 2016-2017, Julien Rouhaud.
 
