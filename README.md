@@ -49,5 +49,5 @@ License
 
 pg_timelord is free software distributed under the PostgreSQL license.
 
-Copyright (c) 2016-2017, Julien Rouhaud.
+Copyright (c) 2016-2023, Julien Rouhaud.
 
